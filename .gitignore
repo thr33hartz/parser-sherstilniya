@@ -1,0 +1,25 @@
+chrome_profile
+__pycache__
+pnl_files
+uploads
+*.DS_Store
+*.env
+*.txtArchive.zip
+chrome_profile.zip
+downloads
+swaps_files
+venv
+*.zip
+*.csvArchive*.zip
+# Игнорировать ZIP-файлы
+*.zip
+
+# Игнорировать директории (например, downloads)
+downloads/
+
+# Игнорировать логи
+*.log
+
+# Другие примеры (добавь свои файлы, если нужно)
+*.csv
+*.png
