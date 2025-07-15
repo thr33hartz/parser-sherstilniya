@@ -26,22 +26,72 @@ PNL_FILTER_CATEGORIES = {
     "💸 Forwarder Tips": ["avg_forwarder_tip"]
 }
 
+DEV_PNL_FILTER_CATEGORIES = {
+    "🚀 Launch Stats": ["total_launched", "migrated_count", "migration_percentage"],
+    "💵 USD Profit": ["pnl_1d_usd", "pnl_7d_usd", "pnl_30d_usd"],
+    "🎯 Winrate": ["winrate"]
+}
+
+def btn(text: str, cb_data: str | None = None):
+    """
+    Возвращает InlineKeyboardButton.
+    Если callback_data не передано, берём text в lower-case без пробелов.
+    """
+    if cb_data is None:
+        cb_data = text.lower().replace(" ", "_")
+    return InlineKeyboardButton(text, callback_data=cb_data)
+
+def get_dev_pnl_filter_main_menu_keyboard() -> InlineKeyboardMarkup:
+    """
+    Создает клавиатуру первого уровня для меню PNL-фильтров разработчиков.
+    """
+    keyboard = []
+    for category_name in DEV_PNL_FILTER_CATEGORIES.keys():
+        keyboard.append(
+            [InlineKeyboardButton(category_name, callback_data=f"dev_pnl_filter_cat_{category_name}")]
+        )
+    
+    keyboard.append([InlineKeyboardButton("🗑️ Сбросить все фильтры", callback_data="dev_pnl_filter_reset_all")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад к настройкам", callback_data="dev_pnl_filter_back_to_settings")])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def get_dev_pnl_filter_submenu_keyboard(category_name: str) -> InlineKeyboardMarkup:
+    """
+    Создает клавиатуру второго уровня для выбора конкретной колонки.
+    """
+    keyboard = []
+    columns = DEV_PNL_FILTER_CATEGORIES.get(category_name, [])
+    
+    for column_name in columns:
+        keyboard.append([
+            InlineKeyboardButton(column_name, callback_data=f"dev_pnl_filter_col_{column_name}")
+        ])
+        
+    keyboard.append([InlineKeyboardButton("⬅️ Назад к категориям", callback_data="dev_pnl_filter_back_to_main")])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+
 def get_pnl_filter_main_menu_keyboard(template_data: dict) -> InlineKeyboardMarkup:
     """
     Создает клавиатуру первого уровня для меню PNL-фильтров (выбор категории).
+    Кнопки выводятся по 2 в ряд.
     """
     keyboard = []
-    # Добавляем кнопки для каждой категории фильтров
-    for category_name in PNL_FILTER_CATEGORIES.keys():
-        keyboard.append([
-            InlineKeyboardButton(category_name, callback_data=f"pnl_filter_cat_{category_name}")
-        ])
-    
-    # Кнопка для сброса всех PNL-фильтров
-    keyboard.append([InlineKeyboardButton("🗑️ Сбросить все PNL-фильтры", callback_data="pnl_filter_reset_all")])
-    # Кнопка для возврата в основное меню настроек шаблона
-    keyboard.append([InlineKeyboardButton("⬅️ Назад к списку шаблонов", callback_data="template_view")])
-    
+    category_names = list(PNL_FILTER_CATEGORIES.keys())
+
+    for i in range(0, len(category_names), 2):
+        row = []
+        for j in range(2):
+            if i + j < len(category_names):
+                name = category_names[i + j]
+                row.append(InlineKeyboardButton(name, callback_data=f"pnl_filter_cat_{name}"))
+        keyboard.append(row)
+
+    keyboard.append([InlineKeyboardButton("🗑️ Reset all PNL filters", callback_data="pnl_filter_reset_all")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back to edit", callback_data="pnl_filter_back_to_template")])
+
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -59,7 +109,7 @@ def get_pnl_filter_submenu_keyboard(category_name: str) -> InlineKeyboardMarkup:
         ])
         
     # Кнопка для возврата на первый уровень PNL-фильтров
-    keyboard.append([InlineKeyboardButton("⬅️ Назад к категориям", callback_data="pnl_filter_back_to_main")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back to categories", callback_data="pnl_filter_back_to_main")])
     
     return InlineKeyboardMarkup(keyboard)
 
@@ -77,12 +127,13 @@ def get_token_parse_settings_keyboard(lang: str, context: ContextTypes.DEFAULT_T
     # --- Логика для кнопки "Platforms" ---
     selected_platforms_count = len(ud.get('token_parse_platforms', []))
     platforms_text_template = get_text(lang, "platforms_btn") # Получаем шаблон "Platforms ({})"
-    platforms_text = platforms_text_template.format(selected_platforms_count)
+    # Update Platforms text icon
+    platforms_text = f"🧩 Platforms ({selected_platforms_count})"
 
     # --- Логика для кнопки "Category" ---
     selected_categories = ud.get('token_parse_categories', [])
-    category_text_template = get_text(lang, "category_btn") # Получаем шаблон "Category ({})"
-    category_text = category_text_template.format(len(selected_categories))
+    # Update Category text icon
+    category_text = f"🗂️ Category ({len(selected_categories)})"
 
     # --- Логика для кнопки "Time Period" ---
     selected_period = ud.get('token_parse_period', '24h')
@@ -95,17 +146,17 @@ def get_token_parse_settings_keyboard(lang: str, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton(category_text, callback_data="tokensettings_category")],
         [InlineKeyboardButton(period_text, callback_data="tokensettings_period")],
         [InlineKeyboardButton(get_text(lang, "parse_now_btn"), callback_data="tokensettings_execute")],
-        [InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="parse_back")]
+        [InlineKeyboardButton("⬅️ Back", callback_data="parse_back")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 def get_parse_submenu_keyboard(lang: str) -> InlineKeyboardMarkup:
     keyboard = [
-        [InlineKeyboardButton(get_text(lang, "all_in_parse_btn"), callback_data="parse_all_in")],
-        [InlineKeyboardButton(get_text(lang, "get_tokens_btn"), callback_data="parse_get_tokens")],
-        [InlineKeyboardButton(get_text(lang, "get_top_traders_btn"), callback_data="parse_get_traders")],
-        [InlineKeyboardButton(get_text(lang, "get_wallet_stats_btn"), callback_data="parse_get_stats")],
-        [InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="parse_back")],
+        [InlineKeyboardButton("🧨 All-in parse", callback_data="parse_all_in")],
+        [InlineKeyboardButton("💠 Get tokens", callback_data="parse_get_tokens")],
+        [InlineKeyboardButton("🏆 Get top traders", callback_data="parse_get_traders")],
+        [InlineKeyboardButton("📈 Get Wallet Stats", callback_data="parse_get_stats")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -118,7 +169,6 @@ def get_main_menu_inline_keyboard(lang: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton(get_text(lang, "bundle_tracker_btn"),callback_data="mainmenu_bundle_tracker")],
         [InlineKeyboardButton(get_text(lang, "copytrade_sim_btn"), callback_data="mainmenu_copytrade_sim"),
          InlineKeyboardButton(get_text(lang, "settings_btn"),      callback_data="mainmenu_settings")],
-        [InlineKeyboardButton("👨‍💻 Contact developer", callback_data="mainmenu_contact_dev")]
 
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -182,9 +232,9 @@ def get_category_selection_keyboard(lang: str, selected_categories: list, contex
 def get_template_management_keyboard(lang: str, user_id: int) -> InlineKeyboardMarkup:
     """Генерирует клавиатуру для управления шаблонами."""
     keyboard = [
-        [InlineKeyboardButton("➕ Добавить шаблон" if lang == "ru" else "➕ Add Template", callback_data="template_create")],
-        [InlineKeyboardButton("📋 Мои шаблоны" if lang == "ru" else "📋 My Templates", callback_data="template_view")],
-        [InlineKeyboardButton("⬅️ Назад" if lang == "ru" else "⬅️ Back", callback_data="parse_back")],
+        [InlineKeyboardButton("➕ Add Template", callback_data="template_create")],
+        [InlineKeyboardButton("📋 My Templates", callback_data="template_view")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="parse_back")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -208,23 +258,23 @@ def get_template_view_keyboard(lang: str, templates: list) -> InlineKeyboardMark
                 callback_data=f"template_delete_{template_id}"
             ),
         ])
-    keyboard.append([InlineKeyboardButton("⬅️ Назад" if lang == "ru" else "⬅️ Back", callback_data="template_back_to_menu")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="template_back_to_menu")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_template_edit_keyboard(lang: str, template: dict) -> InlineKeyboardMarkup:
     """Генерирует клавиатуру для редактирования шаблона."""
     platforms_count = len(template.get("platforms", []))
-    platforms_text = f"Платформы ({platforms_count if platforms_count > 0 else 'Все'})" if lang == "ru" else f"Platforms ({platforms_count if platforms_count > 0 else 'All'})"
+    platforms_text = f"🧩 Platforms ({platforms_count if platforms_count > 0 else 'All'})"
     categories = template.get("categories", [])
-    category_text = f"Категории ({len(categories)})" if lang == "ru" else f"Category ({len(categories)})"
+    category_text = f"🗂️ Category ({len(categories)})"
     period = template.get("time_period", "24h")
-    period_text = f"Период времени ({period})" if lang == "ru" else f"Time Period ({period})"
+    period_text = f"Time Period ({period})"
     keyboard = [
         [InlineKeyboardButton(platforms_text, callback_data=f"template_edit_platforms_{template['id']}")],
         [InlineKeyboardButton(category_text, callback_data=f"template_edit_category_{template['id']}")],
         [InlineKeyboardButton(period_text, callback_data=f"template_edit_period_{template['id']}")],
-        [InlineKeyboardButton("💾 Сохранить" if lang == "ru" else "💾 Save", callback_data=f"template_save_{template['id']}")],
-        [InlineKeyboardButton("⬅️ Назад" if lang == "ru" else "⬅️ Back", callback_data="template_view")],
+        [InlineKeyboardButton("💾 Save", callback_data=f"template_save_{template['id']}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="template_view")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -239,7 +289,7 @@ def get_template_settings_keyboard(lang: str, template_data: dict) -> InlineKeyb
     platforms_text = platforms_text_template.format(platforms_count if platforms_count > 0 else 'All')
     
     categories = template_data.get('categories', [])
-    category_text = f"Категории ({len(categories)})"
+    category_text = f"🗂️ Category ({len(categories)})"
     
     selected_period = template_data.get('time_period', '24h')
     period_text_template = get_text(lang, "time_period_btn")
@@ -249,9 +299,9 @@ def get_template_settings_keyboard(lang: str, template_data: dict) -> InlineKeyb
         [InlineKeyboardButton(platforms_text, callback_data="template_set_platforms")],
         [InlineKeyboardButton(category_text, callback_data="template_set_category")],
         [InlineKeyboardButton(period_text, callback_data="template_set_period")],
-        [InlineKeyboardButton("📊 PNL-фильтры", callback_data="template_set_pnl_filters")],
-        [InlineKeyboardButton("✅ Сохранить шаблон", callback_data="template_set_save")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="template_cancel")],
+        [InlineKeyboardButton("📊 PNL Filters", callback_data="template_set_pnl_filters")],
+        [InlineKeyboardButton("✅ Save Template", callback_data="template_set_save")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="template_cancel")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -267,29 +317,25 @@ def get_template_category_keyboard(lang: str, selected_categories: list) -> Inli
         keyboard.append([InlineKeyboardButton(text, callback_data=f"template_set_toggle_category_{category}")])
     
     # И ИЗМЕНЕНИЕ ЗДЕСЬ:
-    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="template_set_category_done")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="template_set_category_done")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_dev_parse_settings_keyboard(lang: str, context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
-    """Генерирует клавиатуру для настроек Dev Parse."""
+    """
+    Клавиатура для настроек Dev Parse.
+    ИСПРАВЛЕНО: Добавлена кнопка "PNL-фильтры".
+    """
     ud = context.user_data
-    
-    # ИСПРАВЛЕНИЕ: Сначала получаем шаблон, потом форматируем его
-    platforms_count = len(ud.get('dev_parse_platforms', []))
-    platforms_text_template = get_text(lang, "platforms_btn") # Получаем строку "Platforms ({})"
-    platforms_text = platforms_text_template.format(platforms_count if platforms_count > 0 else "All")
-
-    categories_count = len(ud.get('dev_parse_categories', []))
-    category_text = f"Категории ({categories_count})"
-
-    period = ud.get('dev_parse_period', '72h')
-    period_text_template = get_text(lang, "time_period_btn") # Получаем строку "Time Period ({})"
-    period_text = period_text_template.format(period)
+    platforms_text = get_text(lang, "platforms_btn").format(len(ud.get('dev_parse_platforms', [])))
+    category_text = get_text(lang, "category_btn").format(len(ud.get('dev_parse_categories', [])))
+    period_text = get_text(lang, "time_period_btn").format(ud.get('dev_parse_period', '72h'))
 
     keyboard = [
         [InlineKeyboardButton(platforms_text, callback_data="devparse_platforms")],
         [InlineKeyboardButton(category_text, callback_data="devparse_category")],
         [InlineKeyboardButton(period_text, callback_data="devparse_period")],
+        # --- НОВАЯ КНОПКА ---
+        [InlineKeyboardButton("📊 PNL-filters", callback_data="devparse_pnl_filters")],
         [InlineKeyboardButton("✅ Parse Devs", callback_data="devparse_execute")],
         [InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="main_menu")]
     ]
@@ -297,14 +343,40 @@ def get_dev_parse_settings_keyboard(lang: str, context: ContextTypes.DEFAULT_TYP
 
 
 def get_dev_parse_period_keyboard(lang: str, current_period: str) -> InlineKeyboardMarkup:
-    """Клавиатура выбора периода для Dev Parse с расширенным диапазоном до 72 часов."""
+    """Клавиатура выбора периода для Dev Parse (только 24, 48, 72ч)."""
     keyboard = []
-    periods = {'1h': '1 час', '3h': '3 часа', '6h': '6 часов', '12h': '12 часов', '24h': '24 часа', '48h': '48 часов', '72h': '72 часа'}
+    # ИСПРАВЛЕНО: Жестко задаем только нужные варианты
+    periods = {'24h': '24h', '48h': '48h', '72h': '72h'}
     
-    for period_key, period_text_ru in periods.items():
-        text = f"✅ {period_text_ru}" if period_key == current_period else period_text_ru
-        # Обратите внимание на callback_data, он начинается с devparse_
+    for period_key, period_text in periods.items():
+        text = f"✅ {period_text}" if period_key == current_period else period_text
         keyboard.append([InlineKeyboardButton(text, callback_data=f"devparse_period_select_{period_key}")])
         
-    keyboard.append([InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="devparse_period_done")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="devparse_period_done")])
     return InlineKeyboardMarkup(keyboard)
+
+# ui/keyboards.py
+
+def get_main_menu_inline_keyboard(lang: str, premium: bool = False) -> InlineKeyboardMarkup:
+    """
+    Главное меню. callback_data → начинаются с mainmenu_,
+    как и ждёт main_menu_callback_handler.
+    """
+    rows = [
+        [
+            InlineKeyboardButton("🔍 Parse",          callback_data="mainmenu_parse"),
+            InlineKeyboardButton("⚙️ Program Parse",  callback_data="mainmenu_program_parse"),
+        ]
+    ]
+
+    if premium:
+        rows.append([
+            InlineKeyboardButton("📊 Bundle Tracker", callback_data="mainmenu_bundle_tracker"),
+            InlineKeyboardButton("👨‍💻 Dev Parse",      callback_data="mainmenu_dev_parse"),
+        ])
+
+    rows.append([
+        InlineKeyboardButton("🔧 Settings", callback_data="mainmenu_settings")
+    ])
+
+    return InlineKeyboardMarkup(rows)

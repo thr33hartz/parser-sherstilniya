@@ -20,6 +20,7 @@ from jobs.check_bundle_alerts import check_bundle_alerts # TODO: Раскомм�
 
 # --- Модули с обработчиками ---
 from handlers import commands, callbacks, messages
+from handlers.conv_activate import conv_activate
 from jobs.price_job import update_sol_price_job
 
 # --- Настройка логирования ---
@@ -72,7 +73,7 @@ def main():
     
     # --- Команды ---
     application.add_handler(CommandHandler("start", commands.start))
-    application.add_handler(CommandHandler("language", commands.language_command))
+    application.add_handler(conv_activate)
 
     # --- Обработка нажатий на инлайн-кнопки ---
     application.add_handler(CallbackQueryHandler(callbacks.set_language_callback, pattern="^set_lang_"))
@@ -89,6 +90,8 @@ def main():
     application.add_handler(CallbackQueryHandler(callbacks.dev_parse_settings_callback, pattern="^devparse_"))
     application.add_handler(CallbackQueryHandler(callbacks.main_menu_callback_handler, pattern="^mainmenu_"))
     application.add_handler(CallbackQueryHandler(callbacks.pnl_filter_callback_handler, pattern="^pnl_filter_"))
+    application.add_handler(CallbackQueryHandler(callbacks.language_settings_callback, pattern="^settings_language$"))
+    application.add_handler(CallbackQueryHandler(callbacks.dev_pnl_filter_callback_handler, pattern="^dev_pnl_filter_"))
 
     
     # --- Обработка сообщений (текст и файлы) ---

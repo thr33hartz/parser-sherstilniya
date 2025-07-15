@@ -6,7 +6,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL")
-
+TELEGRAM_BOT_LITE_TOKEN = os.getenv("TELEGRAM_BOT_LITE_TOKEN")  # Токен для Lite-версии бота
 # Пути
 CHROME_PROFILE_PATH = os.path.abspath("chrome_profile")
 FILES_DIR = os.path.abspath("pnl_files")

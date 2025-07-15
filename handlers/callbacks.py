@@ -1,3 +1,5 @@
+def get_user_lang(context):
+    return context.user_data.get("lang", "en")
 import asyncio
 import os
 import io
@@ -26,13 +28,13 @@ from ui.keyboards import (
     get_platform_selection_keyboard, get_period_selection_keyboard, get_category_selection_keyboard,
     get_bundle_tracker_keyboard, get_template_management_keyboard, get_template_view_keyboard,
     get_template_edit_keyboard, get_dev_parse_period_keyboard, get_pnl_filter_submenu_keyboard,
-    get_pnl_filter_main_menu_keyboard
+    get_pnl_filter_main_menu_keyboard, get_language_keyboard, get_dev_pnl_filter_main_menu_keyboard, get_dev_pnl_filter_submenu_keyboard
 )
 from ui.translations import get_text, TRANSLATIONS
 
 # Конфигурация и хелперы
 from config import TOKEN_CATEGORIES, MAX_TRACKING_TASKS_PER_USER
-from .commands import ensure_main_msg  # Импортируем из соседнего файла в этой же папке
+from .commands import ensure_main_msg, send_new_main_menu  # Импортируем из соседнего файла в этой же папке
 
 # --- Временные импорты (в будущем переедут в services) ---
 # TODO: Перенести всю работу с Supabase в services/supabase_service.py
@@ -142,7 +144,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_template = get_text(lang, "main_menu_message") 
     menu_text = text_template.format(price_str)
     
-    main_menu_keyboard = get_main_menu_inline_keyboard(lang)
+    main_menu_keyboard = get_main_menu_inline_keyboard(lang, context.user_data.get("premium", False))
 
     # --- УМНАЯ ЛОГИКА ---
     # Проверяем, есть ли в сообщении, с которого пришел запрос, документ (файл)
@@ -160,7 +162,8 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=update.effective_chat.id,
             text=menu_text,
             reply_markup=main_menu_keyboard,
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            disable_web_page_preview=True
         )
         # 3. КРИТИЧЕСКИ ВАЖНО: Обновляем ID главного сообщения в памяти бота.
         #    Теперь все последующие нажатия на кнопки меню будут редактировать это новое сообщение.
@@ -170,9 +173,10 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(
             text=menu_text,
             reply_markup=main_menu_keyboard,
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            disable_web_page_preview=True
         )
-
+        
 async def set_language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Обрабатывает выбор языка, редактирует сообщение и показывает главное меню.
@@ -190,9 +194,39 @@ async def set_language_callback(update: Update, context: ContextTypes.DEFAULT_TY
         query.message.chat_id,
         context,
         get_text(lang_code, "main_menu_message"),
-        reply_markup=get_main_menu_inline_keyboard(lang_code),
+        reply_markup=get_main_menu_inline_keyboard(lang_code, context.user_data.get("premium", False)),
         parse_mode="Markdown"
     )
+
+def apply_dev_pnl_filters(dev_stats_list: list, pnl_filters: dict) -> list:
+    """
+    Применяет PNL-фильтры к списку словарей со статистикой разработчиков.
+    """
+    if not pnl_filters:
+        return dev_stats_list
+
+    # Используем pandas для удобной и быстрой фильтрации
+    df = pd.DataFrame(dev_stats_list)
+    
+    filtered_df = df.copy()
+
+    for column, rules in pnl_filters.items():
+        if column not in filtered_df.columns:
+            continue
+        
+        # Принудительно преобразуем колонку в числовой формат
+        filtered_df[column] = pd.to_numeric(filtered_df[column], errors='coerce')
+        filtered_df.dropna(subset=[column], inplace=True) # Удаляем строки, где преобразование не удалось
+
+        min_val = rules.get('min')
+        max_val = rules.get('max')
+
+        if min_val is not None:
+            filtered_df = filtered_df[filtered_df[column] >= min_val]
+        if max_val is not None:
+            filtered_df = filtered_df[filtered_df[column] <= max_val]
+            
+    return filtered_df.to_dict('records')
 
 async def main_menu_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -205,7 +239,7 @@ async def main_menu_callback_handler(update: Update, context: ContextTypes.DEFAU
     # Сохраняем ID сообщения, чтобы мы всегда знали, какое сообщение редактировать
     context.user_data["main_message_id"] = query.message.message_id
     
-    lang = context.user_data.get("lang", "ru")
+    lang = get_user_lang(context)
     action = query.data.replace("mainmenu_", "")
     
     # Готовим универсальную кнопку "Назад" для всех подменю
@@ -215,7 +249,8 @@ async def main_menu_callback_handler(update: Update, context: ContextTypes.DEFAU
         reply_markup = get_parse_submenu_keyboard(lang)
         await query.message.edit_text(
             get_text(lang, "parse_menu_prompt"), 
-            reply_markup=reply_markup
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
         )
     elif action == "dev_parse":
         # ИСПРАВЛЕНО: Открываем новое меню настроек
@@ -223,46 +258,45 @@ async def main_menu_callback_handler(update: Update, context: ContextTypes.DEFAU
         context.user_data['dev_parse_categories'] = ['completed', 'completing']
         context.user_data['dev_parse_period'] = '72h'
         reply_markup = get_dev_parse_settings_keyboard(lang, context)
-        await query.message.edit_text("⚙️ Настройте фильтры для Dev Parse:", reply_markup=reply_markup)
-        
+        await query.message.edit_text(
+            get_text(lang, "dev_parse_menu_prompt"), # <-- ИЗМЕНЕНО
+            reply_markup=get_dev_parse_settings_keyboard(lang, context),
+            disable_web_page_preview=True
+        )
+                
     elif action == "program_parse":
         context.user_data["state"] = "awaiting_program_parse_program"
         await query.message.edit_text(
-            get_text(lang, "program_parse_prompt_program"), 
-            reply_markup=back_button
+            get_text(lang, "program_parse_prompt_program"), # <-- ИЗМЕНЕНО
+            reply_markup=back_button,
+            disable_web_page_preview=True
         )
+        
     elif action == "bundle_tracker":
         reply_markup = get_bundle_tracker_keyboard(lang)
         await query.message.edit_text(
-            get_text(lang, "bundle_tracker_menu_prompt"), 
-            reply_markup=reply_markup
+            get_text(lang, "bundle_tracker_menu_prompt"), # <-- ИЗМЕНЕНО
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
         )
-        
-    elif action == "contact_dev":
-        await query.answer() # Отвечаем на нажатие
-        try:
-            # Отправляем фото и сразу же удаляем исходное сообщение с кнопками
-            await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=open("contact.jpg", "rb")
-            )
-            await query.message.delete()
-        except FileNotFoundError:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="🤷‍♂️ Ой, кажется, я потерял свою визитку... (файл contact.jpg не найден)"
-            )
-        except Exception as e:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"Произошла ошибка: {e}"
-            )
-        return # Важно завершить выполнение здесь
-    
-    else:  # Для кнопок "Copytrade simulation" и "Settings"
+    elif action == "settings":
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌍 Language", callback_data="settings_language")],
+            [InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="main_menu")]
+        ])
+        await query.message.edit_text(
+            get_text(lang, "settings_menu_prompt"),
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
+        )
+    elif action.startswith("settings_"):
+        await settings_callback_handler(update, context)
+        return
+    else:  # Для кнопок "Copytrade simulation" и других неизвестных
         await query.message.edit_text(
             get_text(lang, "feature_in_development"), 
-            reply_markup=back_button
+            reply_markup=back_button,
+            disable_web_page_preview=True
         )
     
 
@@ -273,7 +307,7 @@ async def parse_submenu_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
 
-    lang = context.user_data.get('lang', 'en')
+    lang = get_user_lang(context)
     command = query.data
     
     # --- Навигация ---
@@ -281,8 +315,9 @@ async def parse_submenu_callback(update: Update, context: ContextTypes.DEFAULT_T
         # Используем edit_text для плавного возврата в главное меню
         await query.message.edit_text(
             text=get_text(lang, "main_menu_message"),
-            reply_markup=get_main_menu_inline_keyboard(lang),
-            parse_mode="Markdown"
+            reply_markup=get_main_menu_inline_keyboard(lang, context.user_data.get("premium", False)),
+            parse_mode="Markdown",
+            disable_web_page_preview=True
         )
         return
 
@@ -295,8 +330,9 @@ async def parse_submenu_callback(update: Update, context: ContextTypes.DEFAULT_T
         user_id = update.effective_user.id
         reply_markup = get_template_management_keyboard(lang, user_id)
         await query.message.edit_text(
-            text="Управление шаблонами для All-in parse:" if lang == "ru" else "Manage templates for All-in parse:",
-            reply_markup=reply_markup
+            get_text(lang, "template_management_prompt"), # <-- ИЗМЕНЕНО
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
         )
         
     elif command == "parse_get_tokens":
@@ -321,12 +357,12 @@ async def parse_submenu_callback(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data['state'] = 'awaiting_trader_list'
         # Обновляем текст, чтобы явно просить только файл
         prompt_text = get_text(lang, "get_traders_prompt").replace("как обычный текст или .txt файл.", "в виде .txt файла.")
-        await query.message.edit_text(text=prompt_text, reply_markup=back_button)
+        await query.message.edit_text(text=prompt_text, reply_markup=back_button, disable_web_page_preview=True)
         
     elif command == "parse_get_stats":
         context.user_data['state'] = 'awaiting_wallet_stats'
         prompt_text = get_text(lang, "get_traders_prompt").replace("контрактов", "кошельков")
-        await query.message.edit_text(text=prompt_text, reply_markup=back_button)
+        await query.message.edit_text(text=prompt_text, reply_markup=back_button, disable_web_page_preview=True)
 
 
 async def token_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -336,25 +372,25 @@ async def token_settings_callback(update: Update, context: ContextTypes.DEFAULT_
     """
     query = update.callback_query
     await query.answer()
-    lang = context.user_data.get('lang', 'en')
+    lang = get_user_lang(context)
     command = query.data
     
     if command == "tokensettings_platforms":
         all_platforms = await supabase_service.fetch_unique_launchpads()
         selected_platforms = context.user_data.get('token_parse_platforms', [])
         reply_markup = get_platform_selection_keyboard(lang, all_platforms, selected_platforms)
-        await query.message.edit_text(text=get_text(lang, "platforms_menu_prompt"), reply_markup=reply_markup)
+        await query.message.edit_text(text=get_text(lang, "platforms_menu_prompt"), reply_markup=reply_markup, disable_web_page_preview=True)
 
     elif command == "tokensettings_category":
         selected_categories = context.user_data.get('token_parse_categories', [])
         # ИСПРАВЛЕНИЕ: Добавляем `context` как третий аргумент
         reply_markup = get_category_selection_keyboard(lang, selected_categories, context)
-        await query.message.edit_text(text=get_text(lang, "category_prompt"), reply_markup=reply_markup)
+        await query.message.edit_text(text=get_text(lang, "category_prompt"), reply_markup=reply_markup, disable_web_page_preview=True)
 
     elif command == "tokensettings_period":
         current_period = context.user_data.get('token_parse_period', '24h')
         reply_markup = get_period_selection_keyboard(lang, current_period)
-        await query.message.edit_text(text=get_text(lang, "time_period_prompt"), reply_markup=reply_markup)
+        await query.message.edit_text(text=get_text(lang, "time_period_prompt"), reply_markup=reply_markup, disable_web_page_preview=True)
 
     elif command == "tokensettings_execute":
         # === ГЛАВНОЕ ИЗМЕНЕНИЕ ===
@@ -373,7 +409,7 @@ async def token_settings_callback(update: Update, context: ContextTypes.DEFAULT_
         run_token_parse_task.delay(chat_id=chat_id, settings=settings)
         
         # Сразу же отвечаем пользователю
-        await query.message.edit_text(text="✅ Ваш запрос принят в очередь и уже выполняется в фоне. Вы получите файл, как только он будет готов.")
+        await query.message.edit_text(text="✅ Ваш запрос принят в очередь и уже выполняется в фоне. Вы получите файл, как только он будет готов.", disable_web_page_preview=True)
 
     elif command == "main_menu": # Эта кнопка возвращает в главное меню из настроек
         await ensure_main_msg(
@@ -381,8 +417,9 @@ async def token_settings_callback(update: Update, context: ContextTypes.DEFAULT_
             query.message.chat_id,
             context,
             text=get_text(lang, "main_menu_message"),
-            reply_markup=get_main_menu_inline_keyboard(lang),
-            parse_mode="Markdown"
+            reply_markup=get_main_menu_inline_keyboard(lang, context.user_data.get("premium", False)),
+            parse_mode="Markdown",
+            disable_web_page_preview=True
         )
 
 
@@ -393,7 +430,7 @@ async def platform_selection_callback(update: Update, context: ContextTypes.DEFA
     """
     query = update.callback_query
     await query.answer()
-    lang = context.user_data.get('lang', 'en')
+    lang = get_user_lang(context)
     command = query.data
     current_state = context.user_data.get('state')
 
@@ -422,7 +459,7 @@ async def platform_selection_callback(update: Update, context: ContextTypes.DEFA
         
         elif current_state == 'dev_parse_editing_platforms':
             reply_markup = get_dev_parse_settings_keyboard(lang, context)
-            await query.message.edit_text("⚙️ Настройте фильтры для Dev Parse:", reply_markup=reply_markup)
+            await query.message.edit_text(get_text(lang, "dev_parse_menu_prompt"), reply_markup=reply_markup)
             context.user_data['state'] = None # Сбрасываем под-состояние
             
         else: # Возврат в обычный Get Tokens
@@ -444,31 +481,52 @@ async def platform_selection_callback(update: Update, context: ContextTypes.DEFA
     await query.message.edit_reply_markup(reply_markup=reply_markup)
 
 async def period_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает выбор периода времени для ВСЕХ меню."""
+    """"Умный" обработчик выбора периода для ВСЕХ меню."""
     query = update.callback_query
     await query.answer()
     lang = context.user_data.get('lang', 'en')
     command = query.data
     current_state = context.user_data.get('state')
 
-    # Логика кнопки "Назад"
+    # Определяем, где хранить данные и куда возвращаться
+    if current_state == 'dev_parse_editing_period':
+        data_source = context.user_data
+        key = 'dev_parse_period'
+    elif current_state == 'template_editing_period':
+        data_source = context.user_data.get('template_data', {})
+        key = 'time_period'
+    else: # По умолчанию для Get Tokens
+        data_source = context.user_data
+        key = 'token_parse_period'
+
+    # --- Логика для кнопок ---
     if command == "period_done":
+        context.user_data['state'] = None # Сбрасываем под-состояние
         if current_state == 'dev_parse_editing_period':
-            context.user_data['state'] = None
-            reply_markup = get_dev_parse_settings_keyboard(lang, context)
-            await query.message.edit_text("⚙️ Настройте фильтры для Dev Parse:", reply_markup=reply_markup)
-        else: # Возврат в обычный Get Tokens
-            reply_markup = get_token_parse_settings_keyboard(lang, context)
-            await query.message.edit_text(text=get_text(lang, "get_tokens_prompt"), reply_markup=reply_markup)
+            await query.message.edit_text(
+                get_text(lang, "dev_parse_menu_prompt"),
+                reply_markup=get_dev_parse_settings_keyboard(lang, context)
+            )
+        elif current_state == 'template_editing_period':
+            await query.message.edit_text(
+                f"Настраиваем шаблон '{data_source.get('template_name', '')}':",
+                reply_markup=get_template_settings_keyboard(lang, data_source)
+            )
+        else: # Возврат в Get Tokens
+            await query.message.edit_text(
+                get_text(lang, "get_tokens_prompt"),
+                reply_markup=get_token_parse_settings_keyboard(lang, context)
+            )
         return
 
     # Логика выбора периода
     selected_period = command.replace("period_select_", "")
+    data_source[key] = selected_period
+    
+    # Обновляем клавиатуру
     if current_state == 'dev_parse_editing_period':
-        context.user_data['dev_parse_period'] = selected_period
         reply_markup = get_dev_parse_period_keyboard(lang, selected_period)
     else:
-        context.user_data['token_parse_period'] = selected_period
         reply_markup = get_period_selection_keyboard(lang, selected_period)
     
     await query.message.edit_reply_markup(reply_markup=reply_markup)
@@ -478,7 +536,7 @@ async def category_selection_callback(update: Update, context: ContextTypes.DEFA
     """"Умный" обработчик выбора категорий для ВСЕХ меню."""
     query = update.callback_query
     await query.answer()
-    lang = context.user_data.get('lang', 'en')
+    lang = get_user_lang(context)
     command = query.data
     current_state = context.user_data.get('state')
 
@@ -497,7 +555,7 @@ async def category_selection_callback(update: Update, context: ContextTypes.DEFA
         if current_state == 'dev_parse_editing_categories':
             context.user_data['state'] = None
             reply_markup = get_dev_parse_settings_keyboard(lang, context)
-            await query.message.edit_text("⚙️ Настройте фильтры для Dev Parse:", reply_markup=reply_markup)
+            await query.message.edit_text(get_text(lang, "dev_parse_menu_prompt"), reply_markup=reply_markup)
         else: # Возврат в Get Tokens
             reply_markup = get_token_parse_settings_keyboard(lang, context)
             await query.message.edit_text(text=get_text(lang, "get_tokens_prompt"), reply_markup=reply_markup)
@@ -522,7 +580,7 @@ async def template_management_callback(update: Update, context: ContextTypes.DEF
     """
     query = update.callback_query
     await query.answer()
-    lang = context.user_data.get('lang', 'en')
+    lang = get_user_lang(context)
     user_id = update.effective_user.id
     command = query.data
     
@@ -535,16 +593,14 @@ async def template_management_callback(update: Update, context: ContextTypes.DEF
             "categories": ["completed", "completing"],
             "pnl_filters": {}
         }
-        await query.message.edit_text(
-            text="Введите название для нового шаблона:",
-            parse_mode='Markdown'
-        )
+        lang = context.user_data.get('lang', 'ru')
+        await query.message.edit_text(get_text(lang, "prompt_template_name"))
 
     elif command == "template_view":
         templates = await supabase_service.fetch_user_templates(user_id)
         reply_markup = get_template_view_keyboard(lang, templates)
         await query.message.edit_text(
-            text="🗂️ **Управление шаблонами**\n\nВыберите шаблон для запуска, редактирования или удаления.",
+            text=get_text(lang, "template_view_prompt"),
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
@@ -554,15 +610,12 @@ async def template_management_callback(update: Update, context: ContextTypes.DEF
         templates = await supabase_service.fetch_user_templates(user_id)
         selected_template = next((t for t in templates if t["id"] == template_id), None)
         if not selected_template:
-            await query.message.edit_text("Ошибка: шаблон не найден.")
+            await query.message.edit_text(get_text(lang, "template_not_found_error"))
             return
 
         queue_len = queue_service.get_queue_length()
         position = queue_len + 1
-        queue_text = (
-            f"⏳ Ваш 'All-In Parse' принят. Вы {position}-й в очереди.\n\n"
-            "Задача запустится, как только освободится воркер."
-        )
+        queue_text = get_text(lang, "all_in_parse_queued").format(position)
         await query.message.edit_text(text=queue_text)
 
         run_all_in_parse_pipeline_task_wrapper.delay(
@@ -576,21 +629,24 @@ async def template_management_callback(update: Update, context: ContextTypes.DEF
         templates = await supabase_service.fetch_user_templates(user_id)
         template = next((t for t in templates if t["id"] == template_id), None)
         if not template:
-            await query.message.edit_text("Ошибка: шаблон не найден.")
+            await query.message.edit_text(get_text(lang, "template_not_found_error"))
             return
         
         context.user_data['template_data'] = template 
         context.user_data['state'] = 'awaiting_template_settings'
         
         reply_markup = get_template_settings_keyboard(lang, template)
-        await query.message.edit_text(f"Редактируем шаблон '{template['template_name']}':", reply_markup=reply_markup)
+        await query.message.edit_text(
+            get_text(lang, "template_editing_prompt").format(template['template_name']),
+            reply_markup=reply_markup
+        )
     
     elif command.startswith("template_delete_"):
         template_id = command.replace("template_delete_", "")
         await supabase_service.delete_template(template_id)
         templates = await supabase_service.fetch_user_templates(user_id)
         await query.message.edit_text(
-            text="Шаблон удален. Ваши шаблоны:",
+            text=get_text(lang, "template_deleted"),
             reply_markup=get_template_view_keyboard(lang, templates)
         )
 
@@ -609,7 +665,7 @@ async def template_settings_callback(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     await query.answer()
     
-    lang = context.user_data.get('lang', 'en')
+    lang = get_user_lang(context)
     command = query.data
     template_data = context.user_data.get('template_data')
 
@@ -625,7 +681,7 @@ async def template_settings_callback(update: Update, context: ContextTypes.DEFAU
 
     elif command == "template_set_category":
         context.user_data['state'] = 'template_editing_categories'
-        await query.message.edit_text("Выберите категории:", reply_markup=get_template_category_keyboard(lang, template_data.get('categories', [])))
+        await query.message.edit_text(get_text(lang, "category_prompt"), reply_markup=get_template_category_keyboard(lang, template_data.get('categories', [])))
     
     # ИСПРАВЛЕНО: Добавлена логика для переключения категорий
     elif command.startswith("template_set_toggle_category_"):
@@ -647,20 +703,34 @@ async def template_settings_callback(update: Update, context: ContextTypes.DEFAU
 
     elif command == "template_set_period":
         context.user_data['state'] = 'template_editing_period'
-        await query.message.edit_text("Выберите период:", reply_markup=get_period_selection_keyboard(lang, template_data.get('time_period', '24h')))
+        await query.message.edit_text(get_text(lang, "time_period_prompt"), reply_markup=get_period_selection_keyboard(lang, template_data.get('time_period', '24h')))
 
     elif command == "template_set_save":
         # Если у шаблона есть 'id', значит мы его редактируем
         if 'id' in template_data:
             # Передаем весь объект template_data, который уже содержит pnl_filters
             await supabase_service.update_template(template_data['id'], template_data)
-            await query.message.edit_text("✅ Шаблон обновлен!")
-        # Если 'id' нет, значит это новый шаблон
+            await query.message.edit_text(
+                text=get_text(lang, "template_updated_successfully"),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="template_view")]
+                ])
+            )        # Если 'id' нет, значит это новый шаблон
         else:
             template_data['user_id'] = update.effective_user.id
             # Передаем весь объект template_data, который будет включать и pnl_filters
             await supabase_service.create_template(template_data)
-            await query.message.edit_text("✅ Шаблон успешно создан!")
+            # --- ВСТАВКА chat_id и main_msg_id перед edit_message_text ---
+            chat_id = update.effective_chat.id
+            main_msg_id = context.user_data.get("main_message_id", query.message.message_id)
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=main_msg_id,
+                text="✅ Шаблон успешно создан!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]
+                ]), disable_web_page_preview=True
+            )
         
         context.user_data.pop('state', None)
         context.user_data.pop('template_data', None)
@@ -682,9 +752,16 @@ async def template_settings_callback(update: Update, context: ContextTypes.DEFAU
 
 
     elif command == "template_set_cancel":
-        await query.message.edit_text("Действие отменено.")
         context.user_data.pop('state', None)
         context.user_data.pop('template_data', None)
+        await query.message.edit_text(get_text(lang, "template_cancelled"))
+        # Можно добавить кнопку для возврата в меню управления шаблонами
+        user_id = update.effective_user.id
+        reply_markup = get_template_management_keyboard(lang, user_id)
+        await query.message.edit_text(
+            get_text(lang, "template_management_prompt"),
+            reply_markup=reply_markup
+        )
 
         
 async def show_user_bundle_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -792,7 +869,7 @@ async def bundle_tracker_callback(update: Update, context: ContextTypes.DEFAULT_
         # Плавный возврат в главное меню
         await query.message.edit_text(
             text=get_text(lang, "main_menu_message"),
-            reply_markup=get_main_menu_inline_keyboard(lang),
+            reply_markup=get_main_menu_inline_keyboard(lang, context.user_data.get("premium", False)),
             parse_mode="Markdown"
         )
         
@@ -838,7 +915,7 @@ async def execute_token_parse(update: Update, context: ContextTypes.DEFAULT_TYPE
     main_msg_id = context.user_data.get("main_message_id", query.message.message_id)
     chat_id = query.message.chat_id
 
-    await context.bot.edit_message_text(chat_id=chat_id, message_id=main_msg_id, text=get_text(lang, "executing_parse"))
+    await context.bot.edit_message_text(chat_id=chat_id, message_id=main_msg_id, text=get_text(lang, "executing_parse"), disable_web_page_preview=True)
     try:
         ud = context.user_data
         selected_platforms = ud.get('token_parse_platforms', [])
@@ -861,7 +938,7 @@ async def execute_token_parse(update: Update, context: ContextTypes.DEFAULT_TYPE
         back_button_markup = InlineKeyboardMarkup([[InlineKeyboardButton(TRANSLATIONS[lang]["back_btn"], callback_data="parse_back")]])
 
         if df.empty:
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=main_msg_id, text=get_text(lang, "no_tokens_found"), reply_markup=back_button_markup)
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=main_msg_id, text=get_text(lang, "no_tokens_found"), reply_markup=back_button_markup, disable_web_page_preview=True)
             return
             
         output = io.StringIO()
@@ -877,7 +954,7 @@ async def execute_token_parse(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.edit_media(media=media_to_upload, reply_markup=back_button_markup)
     except Exception as e:
         # logger.error(...)
-        await context.bot.edit_message_text(chat_id=chat_id, message_id=main_msg_id, text=get_text(lang, "error_occurred"), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(TRANSLATIONS[lang]["back_btn"], callback_data="parse_back")]]))
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=main_msg_id, text=get_text(lang, "error_occurred"), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(TRANSLATIONS[lang]["back_btn"], callback_data="parse_back")]]), disable_web_page_preview=True)
 
 async def run_all_in_parse_pipeline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = context.user_data.get('lang', 'en')
@@ -893,8 +970,8 @@ async def run_all_in_parse_pipeline(update: Update, context: ContextTypes.DEFAUL
                 message_id=main_msg_id,
                 text="Шаблон не выбран или поврежден." if lang == "ru" else "No template selected or template is corrupted.",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Назад" if lang == "ru" else "⬅️ Back", callback_data="parse_back")]
-                ])
+                    [InlineKeyboardButton("⬅️ Back" if lang == "ru" else "⬅️ Back", callback_data="parse_back")]
+                ]), disable_web_page_preview=True
             )
             return
 
@@ -909,8 +986,8 @@ async def run_all_in_parse_pipeline(update: Update, context: ContextTypes.DEFAUL
                     message_id=main_msg_id,
                     text="Шаблон не найден в базе." if lang == "ru" else "Template not found in database.",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⬅️ Назад" if lang == "ru" else "⬅️ Back", callback_data="main_menu")]
-                    ])
+                        [InlineKeyboardButton("⬅️ Back" if lang == "ru" else "⬅️ Back", callback_data="main_menu")]
+                    ]), disable_web_page_preview=True
                 )
                 return
             context.user_data['selected_template'] = selected_template
@@ -929,8 +1006,8 @@ async def run_all_in_parse_pipeline(update: Update, context: ContextTypes.DEFAUL
                 message_id=main_msg_id,
                 text="🤷 За указанный период токены не найдены." if lang == "ru" else "🤷 No tokens found for the specified period.",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Назад" if lang == "ru" else "⬅️ Back", callback_data="main_menu")]
-                ])
+                    [InlineKeyboardButton("⬅️ Back" if lang == "ru" else "⬅️ Back", callback_data="main_menu")]
+                ]), disable_web_page_preview=True
             )
             return
 
@@ -947,7 +1024,7 @@ async def run_all_in_parse_pipeline(update: Update, context: ContextTypes.DEFAUL
                 text="🤷 По заданным критериям токены не найдены." if lang == "ru" else "🤷 No tokens found for the selected criteria.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("⬅️ Назад" if lang == "ru" else "⬅️ Back", callback_data="main_menu")]
-                ])
+                ]), disable_web_page_preview=True
             )
             return
 
@@ -963,7 +1040,7 @@ async def run_all_in_parse_pipeline(update: Update, context: ContextTypes.DEFAUL
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=main_msg_id,
-            text=get_text(lang, "all_in_step1_done")
+            text=get_text(lang, "all_in_step1_done"), disable_web_page_preview=True
         )
         logger.info(f"ALL-IN-PARSE: Step 2: Fetching traders for {len(tokens_with_ids)} tokens...")
         await process_tokens_for_traders(tokens_with_ids)
@@ -979,7 +1056,7 @@ async def run_all_in_parse_pipeline(update: Update, context: ContextTypes.DEFAUL
                 text=get_text(lang, "all_in_no_traders"),
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(TRANSLATIONS[lang]["back_btn"], callback_data="main_menu")]
-                ])
+                ]), disable_web_page_preview=True
             )
             return
 
@@ -988,7 +1065,7 @@ async def run_all_in_parse_pipeline(update: Update, context: ContextTypes.DEFAUL
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=main_msg_id,
-            text=get_text(lang, "all_in_step2_done")
+            text=get_text(lang, "all_in_step2_done"), disable_web_page_preview=True
         )
         logger.info(f"ALL-IN-PARSE: Step 3: Fetching PNL for {len(unique_trader_addresses)} traders...")
         csv_path = await fetch_pnl_via_discord(unique_trader_addresses)
@@ -1012,7 +1089,7 @@ async def run_all_in_parse_pipeline(update: Update, context: ContextTypes.DEFAUL
                 text=get_text(lang, "error_occurred"),
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(TRANSLATIONS[lang]["back_btn"], callback_data="main_menu")]
-                ])
+                ]), disable_web_page_preview=True
             )
     except Exception as e:
         logger.error(f"ALL-IN-PARSE: A critical error occurred in the pipeline: {e}", exc_info=True)
@@ -1022,8 +1099,65 @@ async def run_all_in_parse_pipeline(update: Update, context: ContextTypes.DEFAUL
             text=get_text(lang, "error_occurred"),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(TRANSLATIONS[lang]["back_btn"], callback_data="main_menu")]
-            ])
+            ]), disable_web_page_preview=True        )
+async def dev_pnl_filter_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает всю навигацию внутри меню PNL-фильтров для Dev Parse.
+    """
+    query = update.callback_query
+    await query.answer()
+    lang = context.user_data.get('lang', 'en')
+    command = query.data
+    ud = context.user_data
+
+    # --- Навигация ---
+    if command == "dev_pnl_filter_back_to_settings":
+        # Возврат в главное меню настроек Dev Parse
+        context.user_data['state'] = None # Сбрасываем под-состояние
+        reply_markup = get_dev_parse_settings_keyboard(lang, context)
+        await query.message.edit_text(get_text(lang, "dev_parse_menu_prompt"), reply_markup=reply_markup)
+        return
+
+    if command == "dev_pnl_filter_back_to_main":
+        # Возврат к списку категорий PNL-фильтров
+        pnl_filters = ud.get('dev_pnl_filters', {})
+        text = "📊 **Фильтры PNL для разработчиков**\n\nВыберите категорию для настройки.\n\n**Текущие фильтры:**\n"
+        if not pnl_filters:
+            text += "_Пусто_"
+        else:
+            for col, val in pnl_filters.items():
+                min_v = val.get('min', '-∞')
+                max_v = val.get('max', '+∞')
+                text += f"- `{col.replace('_', ' ')}`: от `{min_v}` до `{max_v}`\n"
+        
+        reply_markup = get_dev_pnl_filter_main_menu_keyboard()
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+        return
+
+    # --- Выбор категории фильтра ---
+    if command.startswith("dev_pnl_filter_cat_"):
+        category_name = command.replace("dev_pnl_filter_cat_", "")
+        reply_markup = get_dev_pnl_filter_submenu_keyboard(category_name)
+        await query.message.edit_text(f"Выберите метрику из категории '{category_name}':", reply_markup=reply_markup)
+        return
+
+    # --- Выбор конкретной колонки для настройки ---
+    if command.startswith("dev_pnl_filter_col_"):
+        column_name = command.replace("dev_pnl_filter_col_", "")
+        context.user_data['dev_pnl_filter_to_set'] = column_name # Запоминаем, какую колонку настраиваем
+        context.user_data['state'] = 'awaiting_dev_pnl_filter_value' # Переходим в состояние ожидания текста
+        
+        await query.message.edit_text(
+            f"Введите мин. и макс. значения для `{column_name}` через пробел (например, `50 100`).\n\n"
+            "Отправьте одно число для минимума или `0` для сброса."
         )
+        return
+
+    # --- Сброс всех PNL-фильтров ---
+    if command == "dev_pnl_filter_reset_all":
+        if 'dev_pnl_filters' in ud:
+            ud.pop('dev_pnl_filters')
+        await query.message.edit_text("Все PNL-фильтры для разработчиков сброшены.", reply_markup=get_dev_pnl_filter_main_menu_keyboard())
         
 async def dev_parse_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает все кнопки в меню Dev Parse."""
@@ -1038,74 +1172,106 @@ async def dev_parse_settings_callback(update: Update, context: ContextTypes.DEFA
         context.user_data['state'] = 'dev_parse_editing_platforms'
         all_platforms = await supabase_service.fetch_unique_launchpads()
         reply_markup = get_platform_selection_keyboard(lang, all_platforms, ud.get('dev_parse_platforms', []))
-        await query.message.edit_text("Выберите платформы для Dev Parse:", reply_markup=reply_markup)
+        await query.message.edit_text(
+            get_text(lang, "dev_parse_platform_prompt"), # <-- ИЗМЕНЕНО
+            reply_markup=reply_markup
+        )
 
     elif command == "devparse_category":
         context.user_data['state'] = 'dev_parse_editing_categories'
         reply_markup = get_category_selection_keyboard(lang, ud.get('dev_parse_categories', []), context)
-        await query.message.edit_text("Выберите категории:", reply_markup=reply_markup)
+        await query.message.edit_text(get_text(lang, "category_prompt"), reply_markup=reply_markup)
 
     elif command == "devparse_period":
         context.user_data['state'] = 'dev_parse_editing_period'
         current_period = ud.get('dev_parse_period', '72h')
         reply_markup = get_dev_parse_period_keyboard(lang, current_period)
-        await query.message.edit_text("Выберите период времени:", reply_markup=reply_markup)
+        await query.message.edit_text(get_text(lang, "time_period_prompt"), reply_markup=reply_markup)
     
     elif command.startswith("devparse_period_select_"):
         selected_period = command.replace("devparse_period_select_", "")
         ud['dev_parse_period'] = selected_period
         await query.message.edit_reply_markup(reply_markup=get_dev_parse_period_keyboard(lang, selected_period))
-
+        
+    elif command == "devparse_pnl_filters":
+        # Получаем текущие фильтры из памяти
+        pnl_filters = ud.get('dev_pnl_filters', {})
+        
+        # Формируем красивое сообщение с текущими фильтрами
+        text = "📊 **Фильтры PNL для разработчиков**\n\nВыберите категорию для настройки.\n\n**Текущие фильтры:**\n"
+        if not pnl_filters:
+            text += "_Пусто_"
+        else:
+            for col, val in pnl_filters.items():
+                min_v = val.get('min', '-∞')
+                max_v = val.get('max', '+∞')
+                # Экранируем символы для Markdown
+                escaped_col = col.replace('_', '\\_')
+                text += f"- `{escaped_col}`: от `{min_v}` до `{max_v}`\n"
+        
+        reply_markup = get_dev_pnl_filter_main_menu_keyboard()
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+        
     elif command == "devparse_period_done":
         context.user_data['state'] = None # Сбрасываем под-состояние
         reply_markup = get_dev_parse_settings_keyboard(lang, context)
-        await query.message.edit_text("⚙️ Настройте фильтры для Dev Parse:", reply_markup=reply_markup)
+        await query.message.edit_text(get_text(lang, "dev_parse_menu_prompt"), reply_markup=reply_markup)
 
     elif command == "devparse_execute":
-        await query.message.edit_text("🔍 Выполняю поиск и формирую отчет...")
+        await query.message.edit_text("🔍 Выполняю поиск и фильтрацию...")
         
         hours = int(ud.get('dev_parse_period', '72h').replace('h', ''))
         start_time = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-        # Шаг 1: Получаем статистику по девам
-        dev_stats = await supabase_service.fetch_dev_stats_by_criteria(
+        initial_dev_stats = await supabase_service.fetch_dev_stats_by_criteria(
             start_time, ud.get('dev_parse_platforms', []), ud.get('dev_parse_categories', [])
         )
-        if not dev_stats:
-            await query.message.edit_text("🤷 По вашим критериям разработчики не найдены.")
+
+        if not initial_dev_stats:
+            await query.message.edit_text("🤷 По вашим критериям токенов разработчики не найдены.")
             return
+
+        pnl_filters = ud.get('dev_pnl_filters', {})
+        final_dev_stats = apply_dev_pnl_filters(initial_dev_stats, pnl_filters)
         
-        # Отправляем первый файл
+        if not final_dev_stats:
+            await query.message.edit_text("🤷 Разработчики, соответствующие PNL-фильтрам, не найдены.")
+            return
+
+        chat_id = update.effective_chat.id
+
+        # 1. Отправляем первый файл (PNL)
         pnl_output = io.StringIO()
-        pd.DataFrame(dev_stats).to_csv(pnl_output, index=False)
+        pd.DataFrame(final_dev_stats).to_csv(pnl_output, index=False)
         pnl_csv_bytes = io.BytesIO(pnl_output.getvalue().encode('utf-8'))
-        pnl_csv_bytes.name = "dev_pnl_stats.csv"
+        pnl_csv_bytes.name = "dev_pnl_stats_filtered.csv"
         await context.bot.send_document(
-            chat_id=update.effective_chat.id,
+            chat_id=chat_id,
             document=pnl_csv_bytes,
-            caption=f"✅ Ваш PNL-отчет по разработчикам готов. Найдено: {len(dev_stats)} девов."
+            caption=f"✅ Ваш PNL-отчет по разработчикам готов. Найдено (после всех фильтров): {len(final_dev_stats)} девов."
         )
 
-        # Шаг 2: Получаем их токены
-        await query.message.edit_text("⚙️ Загружаю список всех токенов, созданных этими разработчиками...")
-        developer_addresses = [dev['developer_address'] for dev in dev_stats]
+        # Сообщение о статусе перед отправкой второго файла
+        await query.message.edit_text("⚙️ Загружаю список токенов для отфильтрованных разработчиков...")
+        
+        # 2. Отправляем второй файл (токены)
+        developer_addresses = [dev['developer_address'] for dev in final_dev_stats]
         deployed_tokens = await supabase_service.fetch_deployed_tokens_for_devs(developer_addresses)
         
         if deployed_tokens:
             tokens_output = io.StringIO()
             pd.DataFrame(deployed_tokens).to_csv(tokens_output, index=False)
             tokens_csv_bytes = io.BytesIO(tokens_output.getvalue().encode('utf-8'))
-            tokens_csv_bytes.name = "dev_deployed_tokens.csv"
+            tokens_csv_bytes.name = "dev_deployed_tokens_filtered.csv"
             await context.bot.send_document(
-                chat_id=update.effective_chat.id,
+                chat_id=chat_id,
                 document=tokens_csv_bytes,
-                caption=f"✅ Список из {len(deployed_tokens)} токенов, созданных найденными разработчиками."
+                caption=f"✅ Список из {len(deployed_tokens)} токенов, созданных отфильтрованными разработчиками."
             )
         
-        # Завершаем, добавив кнопку "Назад"
-        back_button = InlineKeyboardMarkup([[InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="main_menu")]])
-        await query.message.edit_text("Все отчеты успешно отправлены!", reply_markup=back_button)
-        
+        # 3. 🔥 ГЛАВНОЕ ИЗМЕНЕНИЕ: Отправляем новое главное меню вниз
+        await send_new_main_menu(context.bot, chat_id, context)
+                
 async def pnl_filter_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обрабатывает всю навигацию внутри меню PNL-фильтров.
@@ -1121,14 +1287,14 @@ async def pnl_filter_callback_handler(update: Update, context: ContextTypes.DEFA
         return
 
     # --- Навигация ---
-    if command == "pnl_filter_back_to_template":
+    elif command == "pnl_filter_back_to_template":
         # Возврат в главное меню настроек шаблона
         context.user_data['state'] = 'awaiting_template_settings'
         reply_markup = get_template_settings_keyboard(lang, template_data)
         await query.message.edit_text(f"Настраиваем шаблон '{template_data['template_name']}':", reply_markup=reply_markup)
         return
 
-    if command == "pnl_filter_back_to_main":
+    elif command == "pnl_filter_back_to_main":
         # Возврат к списку категорий PNL-фильтров
         pnl_filters = template_data.get('pnl_filters', {})
         text = "📊 **PNL-фильтры**\n\nВыберите категорию для настройки.\n\n**Текущие фильтры:**\n"
@@ -1143,14 +1309,14 @@ async def pnl_filter_callback_handler(update: Update, context: ContextTypes.DEFA
         return
 
     # --- Выбор категории фильтра ---
-    if command.startswith("pnl_filter_cat_"):
+    elif command.startswith("pnl_filter_cat_"):
         category_name = command.replace("pnl_filter_cat_", "")
         reply_markup = get_pnl_filter_submenu_keyboard(category_name)
         await query.message.edit_text(f"Выберите метрику из категории '{category_name}':", reply_markup=reply_markup)
         return
 
     # --- Выбор конкретной колонки для настройки ---
-    if command.startswith("pnl_filter_col_"):
+    elif command.startswith("pnl_filter_col_"):
         column_name = command.replace("pnl_filter_col_", "")
         context.user_data['pnl_filter_to_set'] = column_name # Запоминаем, какую колонку настраиваем
         context.user_data['state'] = 'awaiting_pnl_filter_value' # Переходим в состояние ожидания текста
@@ -1163,7 +1329,31 @@ async def pnl_filter_callback_handler(update: Update, context: ContextTypes.DEFA
         return
 
     # --- Сброс всех PNL-фильтров ---
-    if command == "pnl_filter_reset_all":
+    elif command == "pnl_filter_reset_all":
         if 'pnl_filters' in template_data:
             template_data.pop('pnl_filters')
-        await query.message.edit_text("Все PNL-фильтры сброшены.", reply_markup=get_pnl_filter_main_menu_keyboard(template_data))
+        await query.message.edit_text(get_text(lang, "pnl_filter_reset_all"), reply_markup=get_pnl_filter_main_menu_keyboard(template_data))
+        
+# New handler for settings submenus
+async def settings_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    action = query.data
+
+    if action == "settings_language":
+        reply_markup = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🇷🇺 Русский", callback_data="setlang_ru"),
+                InlineKeyboardButton("🇬🇧 English", callback_data="setlang_en")
+            ],
+            [InlineKeyboardButton(get_text(lang, "back_btn"), callback_data="main_menu")]
+        ])
+        await query.message.edit_text(get_text(lang, "language_select_prompt"), reply_markup=reply_markup)
+        
+async def language_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = get_user_lang(context)
+    reply_markup = get_language_keyboard()
+    await query.message.edit_text(get_text(lang, "choose_language_prompt"), reply_markup=reply_markup)

@@ -8,12 +8,13 @@ Selenium-помощник для команды /programswaps (Program Parse).
 """
 
 from __future__ import annotations
-
+import pandas as pd
+from datetime import datetime
 import logging
 import os
 import time
-import uuid
 from typing import Optional
+import io
 
 import requests
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
@@ -103,27 +104,105 @@ def perform_program_swaps(driver, program: str, interval: str,
 
         logger.info("Slash-command sent: %s / %s", program, interval)
 
-        # ── Шаг 2. Ждём появления НОВОЙ ссылки на .csv
-        def _csv_ready(drv):
-            return len(drv.find_elements(By.CSS_SELECTOR,
-                                         ATTACHMENT_LINK_SELECTOR)) > initial_cnt
+        # ── Шаг 2. Ждём появления НОВОЙ ссылки на .csv (или кнопки Result)
+        def detect_result_message(driver):
+            all_messages = driver.find_elements(By.CSS_SELECTOR, "div[data-list-item-id^='chat-messages___']")
+            if len(driver.find_elements(By.CSS_SELECTOR, ATTACHMENT_LINK_SELECTOR)) > initial_cnt:
+                link_el = driver.find_elements(By.CSS_SELECTOR, ATTACHMENT_LINK_SELECTOR)[-1]
+                return {"type": "direct_link", "url": link_el.get_attribute("href")}
+            try:
+                result_button = all_messages[-1].find_element(By.XPATH, ".//button[.//div[text()='Result']]")
+                return {"type": "button", "element": result_button}
+            except NoSuchElementException:
+                return False
 
-        WebDriverWait(driver, timeout).until(_csv_ready)
-        csv_link_el = driver.find_elements(By.CSS_SELECTOR,
-                                           ATTACHMENT_LINK_SELECTOR)[-1]
-        download_url = csv_link_el.get_attribute("href")
-        logger.info("CSV link detected: %s", download_url)
+        result_info = WebDriverWait(driver, timeout).until(detect_result_message)
 
-        # ── Шаг 3. Скачиваем файл
-        resp = requests.get(download_url, timeout=60)
-        resp.raise_for_status()
-        filename = f"swaps_{program[:6]}_{interval}_{uuid.uuid4()}.csv"
-        save_path = os.path.join(SWAPS_DIR, filename)
-        with open(save_path, "wb") as f:
-            f.write(resp.content)
-        logger.info("CSV saved to %s", save_path)
-        return save_path
+        if not result_info:
+            raise TimeoutException("No result (csv or button) received.")
+
+        if result_info["type"] == "direct_link":
+            try:
+                latest_links = driver.find_elements(By.CSS_SELECTOR, ATTACHMENT_LINK_SELECTOR)
+                if not latest_links:
+                    raise Exception("CSV link not found after expected time.")
+                csv_link_el = latest_links[-1]
+                download_url = csv_link_el.get_attribute("href")
+                resp = requests.get(download_url, timeout=60)
+                resp.raise_for_status()
+                df = pd.read_csv(io.BytesIO(resp.content))
+
+                # берём только signer, удаляем пустые и дубликаты
+                signers = df["signer"].dropna().drop_duplicates()
+
+                # формируем имя файла
+                timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                filename  = f"program_parse_{interval}_{program[:6]}_{timestamp}.txt"
+                save_path = os.path.join(SWAPS_DIR, filename)
+
+                # сохраняем txt
+                signers.to_csv(save_path, index=False, header=False)
+                logger.info("Program Parse: signers saved to %s", save_path)
+                return save_path
+            except Exception as e:
+                logger.error("Failed to retrieve or save CSV file: %s", e, exc_info=True)
+                return None
+
+        elif result_info["type"] == "button":
+            result_button = result_info["element"]
+            driver.execute_script("arguments[0].click();", result_button)
+            visit_site_button = WebDriverWait(driver, 30).until(
+                EC.element_to_be_clickable((By.XPATH, ".//button[.//span[text()='Visit site']]"))
+            )
+            driver.execute_script("arguments[0].click();", visit_site_button)
+
+            # Ждем загрузки
+            download_dir = os.path.abspath("downloads")
+            end_time = time.time() + timeout
+            while time.time() < end_time:
+                downloaded_files = [f for f in os.listdir(download_dir) if not f.endswith('.crdownload')]
+                if downloaded_files:
+                    full_paths = [os.path.join(download_dir, f) for f in downloaded_files]
+                    latest_file = max(full_paths, key=os.path.getctime)
+                    logger.info("File downloaded: %s", latest_file)
+                    return latest_file
+                time.sleep(1)
+            raise TimeoutException("File was not downloaded after clicking 'Visit site'.")
 
     except (TimeoutException, NoSuchElementException) as exc:
         logger.error("ProgramSwaps failed: %s", exc, exc_info=True)
         return None
+
+# ─────────────────────────────── CLI helper ──────────────────────────────── #
+if __name__ == "__main__":
+    """
+    Быстрый запуск из терминала:
+        python workers/get_program_swaps.py
+    Использует авторизованный Chrome‑профиль из config.CHROME_PROFILE_PATH
+    и сохраняет txt‑файл со списком signer‑кошельков.
+    """
+    import config
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+
+    PROGRAM  = "b1oodsU6wfkFxkXKU9hTXPzHisopCbE1NKP5RFQLy7e"
+    INTERVAL = "24h"
+
+    opts = Options()
+    opts.add_argument(f"--user-data-dir={config.CHROME_PROFILE_PATH}")
+    opts.add_argument("--headless=new")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+
+    print("[ProgramSwaps] Launching Chrome…")
+    drv = webdriver.Chrome(options=opts)
+    try:
+        result_path = perform_program_swaps(drv, program=PROGRAM, interval=INTERVAL)
+        if result_path:
+            print(f"[ProgramSwaps] Success! File saved to: {result_path}")
+        else:
+            print("[ProgramSwaps] Failed to fetch swaps.")
+    finally:
+        drv.quit()
+        print("[ProgramSwaps] Chrome closed.")

@@ -14,14 +14,16 @@ from typing import List, Optional
 
 import pandas as pd
 import requests
-from selenium.common.exceptions import (NoSuchElementException,
-                                        TimeoutException)
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    TimeoutException,
+    StaleElementReferenceException,   # ← добавили
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-import config
-
+import config        # абсолютный
 # ────────────────────────── Constants / selectors ────────────────────────── #
 # ────────────────────────── Constants / selectors ────────────────────────── #
 TARGET_DM_URL = "https://discord.com/channels/@me/1331338750789419090"
@@ -35,8 +37,11 @@ PNLPLUS_COMMAND_SELECTOR = "button[aria-label='Send pnlplus']"
 MESSAGE_TEXTBOX_SELECTOR = "div[role='textbox']"
 ATTACHMENT_LINK_SELECTOR = "a[href*='cdn.discordapp.com/attachments'][href*='.csv']"
 FILE_INPUT_SELECTOR = "input[type='file']"
-RESULT_BUTTON_SELECTOR = ".//button[.//div[text()='Result']]"
-VISIT_SITE_BUTTON_SELECTOR = ".//button[.//div[text()='Visit site']]"
+RESULT_BUTTON_SELECTOR = ".//button[contains(normalize-space(.), 'Result')]"
+VISIT_SITE_BUTTON_SELECTOR = (
+    "//button[contains(normalize-space(.), 'Visit') "
+    "and contains(translate(normalize-space(.), 'SITE', 'site'), 'site')]"
+)
 
 # ensure output dir exists
 os.makedirs(FILES_DIR, exist_ok=True)
@@ -164,7 +169,7 @@ def _postprocess_csv(file_path: str) -> None:
 
     try:
         # Сначала пробуем стандартную и самую быструю
-        df = pd.read_csv(file_path, encoding='utf-8')
+        df = pd.read_csv(file_path, encoding='utf-8', dtype=str, low_memory=False)
     except UnicodeDecodeError:
         # Если не вышло, пробуем другую популярную кодировку
         logger.warning("UTF-8 decoding failed, trying 'utf-16'.")
@@ -213,7 +218,7 @@ def wait_for_download_and_get_path(timeout: int = 300) -> Optional[str]:
 
 def perform_pnl_fetch(driver, traders: List[str], timeout: int = 300) -> Optional[str]:
     """
-    Запрашивает PNL, используя "умную" навигацию и JS-клики.
+    Запрашивает PNL и обрабатывает ответ, используя надежный метод ожидания.
     """
     upload_file = None
     try:
@@ -223,88 +228,83 @@ def perform_pnl_fetch(driver, traders: List[str], timeout: int = 300) -> Optiona
         
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "main[class*='chatContent']")))
         
-        # --- УМНАЯ ЛОГИКА НАВИГАЦИИ ---
+        # --- ИСПРАВЛЕНИЕ: Определяем ОБЕ переменные здесь, ДО их использования ---
+        messages = driver.find_elements(By.CSS_SELECTOR, MESSAGE_LIST_ITEM_SELECTOR)
+        last_message_id = messages[-1].get_attribute('id') if messages else "0"
+        initial_msg_cnt = len(messages)
+        logger.info(f"SELENIUM(PNL): Initial state: {initial_msg_cnt} messages, last ID: {last_message_id}")
+
+        # --- Шаг 2: Отправка команды ---
         wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, COMMANDS_BUTTON_SELECTOR))).click()
         time.sleep(1)
-
-        try:
-            command_button = driver.find_element(By.CSS_SELECTOR, PNLPLUS_COMMAND_SELECTOR)
-            logger.info("SELENIUM(PNL): Command button found directly.")
-        except NoSuchElementException:
-            logger.info("SELENIUM(PNL): Command not found, clicking bot icon...")
-            bot_icon_selector = "div[aria-label*='Wallet Master+']"
-            bot_icon_element = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, bot_icon_selector)))
-            
-            # ИСПРАВЛЕНО: Используем JavaScript для клика
-            driver.execute_script("arguments[0].click();", bot_icon_element)
-            
-            time.sleep(1)
-            command_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, PNLPLUS_COMMAND_SELECTOR)))
-
-        command_button.click()
-        logger.info("SELENIUM(PNL): Clicked 'pnlplus' button.")
-
-        # --- Остальная логика без изменений ---
+        wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, PNLPLUS_COMMAND_SELECTOR))).click()
         upload_file = _create_trader_list_file(traders)
         file_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, FILE_INPUT_SELECTOR)))
         file_input.send_keys(upload_file)
-        msg_box = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, MESSAGE_TEXTBOX_SELECTOR)))
+        msg_box = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div[class*='slateContainer'] div[role='textbox']")))
         time.sleep(3)
         msg_box.send_keys(Keys.ENTER)
         logger.info("SELENIUM(PNL): Command sent. Waiting for bot response...")
-        # --- ФИНАЛЬНАЯ ЛОГИКА ОЖИДАНИЯ И СКАЧИВАНИЯ ---
         
-        # --- ФИНАЛЬНАЯ ЛОГИКА ОЖИДАНИЯ ---
+        # --- Шаг 3: Логика ожидания ---
         def find_new_result_and_process(driver):
-            # На каждой итерации ожидания мы будем заново искать все сообщения
-            all_messages = driver.find_elements(By.CSS_SELECTOR, MESSAGE_LIST_ITEM_SELECTOR)
-            
-            # Если нового сообщения нет, выходим и ждем дальше
-            if not all_messages or len(all_messages) < initial_msg_cnt + 2:
+            # Discord может пересоздавать DOM → ловим StaleElementReference
+            try:
+                all_messages = driver.find_elements(By.CSS_SELECTOR, MESSAGE_LIST_ITEM_SELECTOR)
+            except StaleElementReferenceException:
                 return False
 
-            last_message = all_messages[-1]
+            if len(all_messages) <= initial_msg_cnt:
+                return False
+
             try:
-                # Пытаемся найти прямую ссылку
-                link_element = last_message.find_element(By.CSS_SELECTOR, ATTACHMENT_LINK_SELECTOR)
-                download_url = link_element.get_attribute("href")
-                
-                # Если нашли - сразу скачиваем и возвращаем путь
-                resp = requests.get(download_url, timeout=60)
-                resp.raise_for_status()
-                saved_path = os.path.join(FILES_DIR, f"pnl_{uuid.uuid4()}.csv")
-                with open(saved_path, "wb") as f: f.write(resp.content)
-                return saved_path
+                last_message = all_messages[-1]
+            except (IndexError, StaleElementReferenceException):
+                return False
 
-            except NoSuchElementException:
-                # Если прямой ссылки нет, ищем кнопку "Result"
-                try:
-                    result_button = last_message.find_element(By.XPATH, RESULT_BUTTON_SELECTOR)
-                    driver.execute_script("arguments[0].click();", result_button)
-                    
-                    # Ждем и кликаем "Visit site"
-                    visit_site_button = wait.until(EC.element_to_be_clickable((By.XPATH, VISIT_SITE_BUTTON_SELECTOR)))
-                    driver.execute_script("arguments[0].click();", visit_site_button)
+            # 1) прямая ссылка
+            try:
+                link = last_message.find_element(By.CSS_SELECTOR, ATTACHMENT_LINK_SELECTOR)
+                return {"type": "direct_link", "url": link.get_attribute("href")}
+            except (NoSuchElementException, StaleElementReferenceException):
+                pass
 
-                    # Ждем скачивания файла
-                    downloaded_path = wait_for_download_and_get_path()
-                    if not downloaded_path:
-                        raise TimeoutException("File was not downloaded after clicking 'Visit Site'.")
-                    return downloaded_path
-                except (NoSuchElementException, TimeoutException):
-                    # В последнем сообщении нет ни того, ни другого, ждем дальше
-                    return False
+            # 2) кнопка «Result»
+            try:
+                btn = last_message.find_element(By.XPATH, RESULT_BUTTON_SELECTOR)
+                return {"type": "button", "element": btn}
+            except (NoSuchElementException, StaleElementReferenceException):
+                return False
+
+        result_info = long_wait.until(find_new_result_and_process)
         
-        # --- Запоминаем количество сообщений и запускаем ожидание ---
-        initial_msg_cnt = len(driver.find_elements(By.CSS_SELECTOR, MESSAGE_LIST_ITEM_SELECTOR))
-        final_path = long_wait.until(find_new_result_and_process)
-        
-        if not final_path:
-            raise Exception("Failed to download the file using any method.")
+        if not result_info:
+            raise ValueError("Could not find a result (direct link or button).")
 
-        logger.info("SELENIUM(PNL): File obtained and saved to %s", final_path)
-        _postprocess_csv(final_path)
-        return final_path
+        # --- Шаг 4: Обработка результата ---
+        saved_path = None
+        if result_info["type"] == "direct_link":
+            resp = requests.get(result_info["url"], timeout=60)
+            resp.raise_for_status()
+            saved_path = os.path.join(FILES_DIR, f"pnl_{uuid.uuid4()}.csv")
+            with open(saved_path, "wb") as f:
+                f.write(resp.content)
+        
+        elif result_info["type"] == "button":
+            result_button = result_info["element"]
+            driver.execute_script("arguments[0].click();", result_button)
+            visit_site_button = wait.until(EC.element_to_be_clickable((By.XPATH, VISIT_SITE_BUTTON_SELECTOR)))
+            driver.execute_script("arguments[0].click();", visit_site_button)
+            saved_path = wait_for_download_and_get_path()
+            if not saved_path:
+                raise TimeoutException("File was not downloaded after clicking 'Visit Site'.")
+
+        if not saved_path:
+            raise Exception("Failed to get file path.")
+
+        logger.info("SELENIUM(PNL): File obtained and saved to %s", saved_path)
+        _postprocess_csv(saved_path)
+        return saved_path
 
     except Exception as exc:
         logger.error("SELENIUM(PNL): A critical error occurred: %s", exc, exc_info=True)

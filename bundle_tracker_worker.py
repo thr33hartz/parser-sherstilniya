@@ -14,13 +14,15 @@ import os
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, List
+from typing import Any, List, Coroutine
 import uuid
+import itertools
+import re
 
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PwTimeout
+from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PwTimeout, Route, Playwright
 from supabase import create_client
 
 # ──────────── ENV ────────────
@@ -28,8 +30,9 @@ load_dotenv()
 SUPABASE_URL  = os.getenv("SUPABASE_URL")
 SUPABASE_KEY  = os.getenv("SUPABASE_KEY")
 HEADLESS      = os.getenv("HEADLESS", "1") == "1"
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 30))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 60)) # Увеличено для стабильности
 DOWNLOAD_DIR  = os.getenv("DOWNLOAD_DIR", "downloads")
+MAX_RETRIES   = 3
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s",
@@ -39,28 +42,84 @@ sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 if not os.path.isdir(DOWNLOAD_DIR):
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ──────────── Browser ctx ────────────
-@asynccontextmanager
-async def browser_ctx() -> Browser:  # typo fixed earlier
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=HEADLESS)
-        try:
-            yield browser
-        finally:
+# ──────────── Proxy rotation ────────────
+RAW_PROXIES = [
+    # Вставьте сюда ваш список купленных прокси
+    "91.124.101.121:51523:HTTP:kdjkprokmp:xfP752jfzb",
+    "195.178.135.122:51523:HTTP:kdjkprokmp:xfP752jfzb",
+    "95.135.59.114:51523:HTTP:kdjkprokmp:xfP752jfzb",
+    "92.118.138.244:51523:HTTP:kdjkprokmp:xfP752jfzb",
+    "185.2.212.223:51523:HTTP:kdjkprokmp:xfP752jfzb",
+]
+
+def _to_proxy_url(line: str) -> str:
+    ip, port, scheme, user, pwd = line.split(":")
+    return f"{scheme.lower()}://{user}:{pwd}@{ip}:{port}"
+
+PROXIES = [_to_proxy_url(p) for p in RAW_PROXIES]
+
+# ──────────── User‑Agent rotation ────────────
+UA_LIST = [
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"),
+]
+_ua_cycle = itertools.cycle(UA_LIST)
+
+# ──────────── Resource Blocker ────────────
+BLOCK_RESOURCE_PATTERN = re.compile(r"\.(css|jpg|jpeg|png|gif|svg|woff|woff2)|(google|doubleclick)")
+
+async def block_unnecessary_requests(route: Route):
+    if BLOCK_RESOURCE_PATTERN.search(route.request.url):
+        await route.abort()
+    else:
+        await route.continue_()
+
+# ──────────── ИСПРАВЛЕНИЕ: Улучшенная функция для проверки прокси ────────────
+async def check_proxy(pw: Playwright, proxy_url: str) -> bool:
+    """Проверяет работоспособность прокси, заходя на тестовый сайт и на Solscan."""
+    browser = None
+    try:
+        logging.info(f"Проверка прокси: {proxy_url}...")
+        browser = await pw.chromium.launch(headless=HEADLESS, proxy={"server": proxy_url})
+        context = await browser.new_context(ignore_https_errors=True, user_agent=next(_ua_cycle))
+        page = await context.new_page()
+
+        # Этап 1: Проверка базового подключения
+        logging.info(f"[{proxy_url}] Этап 1/2: Проверка доступа в интернет...")
+        await page.goto("https://api.ipify.org", timeout=20_000, wait_until="domcontentloaded")
+        content = await page.text_content()
+        if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", content.strip()):
+            logging.warning(f"ОШИБКА: Прокси {proxy_url} вернул неожиданный ответ: {content}")
+            return False
+        logging.info(f"[{proxy_url}] Этап 1/2: Успешно. IP: {content.strip()}")
+
+        # Этап 2: Проверка доступа к Solscan
+        logging.info(f"[{proxy_url}] Этап 2/2: Проверка доступа к Solscan...")
+        await page.goto("https://solscan.io", timeout=30_000, wait_until="domcontentloaded")
+        # Ищем элемент, который точно есть на главной странице Solscan
+        await page.wait_for_selector("input[placeholder='Search for Txn, Addr, Block, Token...']", timeout=15_000)
+        logging.info(f"УСПЕХ: Прокси {proxy_url} работает и имеет доступ к Solscan.")
+        return True
+
+    except Exception as e:
+        logging.warning(f"ОШИБКА: Прокси {proxy_url} не прошел проверку: {str(e).splitlines()[0]}")
+        return False
+    finally:
+        if browser:
             await browser.close()
 
 # ──────────── Download helpers ────────────
 async def click_export(page: Page) -> None:
-    """Нажимаем Export CSV на главном экране"""
     try:
-        await page.get_by_role("button", name="Export CSV").click()
-    except Exception:
+        await page.get_by_role("button", name="Export CSV").click(timeout=15000)
+    except PwTimeout:
+        logging.warning("Standard 'Export CSV' button not found, trying SVG icon.")
         await page.locator("svg[data-tooltip-id='export']").first.click()
 
 async def click_dialog_download(page: Page) -> str | None:
-    """Ждём диалог и скачиваем CSV. Возвращает путь."""
     try:
-        async with page.expect_download(timeout=30_000) as info:
+        async with page.expect_download(timeout=60_000) as info:
             await page.locator("button:has(svg.lucide-cloud-download)").click()
         download = await info.value
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -69,7 +128,7 @@ async def click_dialog_download(page: Page) -> str | None:
         logging.info("CSV saved → %s", path)
         return path
     except PwTimeout:
-        logging.error("Timeout waiting for Download dialog")
+        logging.error("Timeout waiting for Download dialog button.")
         return None
 
 async def grab_csv(address: str, browser: Browser) -> pd.DataFrame | None:
@@ -78,134 +137,132 @@ async def grab_csv(address: str, browser: Browser) -> pd.DataFrame | None:
         "?exclude_amount_zero=false&remove_spam=false&flow=out"
         "&token_address=So11111111111111111111111111111111111111111#transfers"
     )
-    ctx = await browser.new_context()
-    page = await ctx.new_page()
-    await page.goto(url, wait_until="domcontentloaded")
-    await click_export(page)
-    path = await click_dialog_download(page)
-    await ctx.close()
-    if not path:
-        return None
+    page = None
+    ctx = None
     try:
+        ctx = await browser.new_context(user_agent=next(_ua_cycle), accept_downloads=True)
+        page = await ctx.new_page()
+        await page.route(BLOCK_RESOURCE_PATTERN, block_unnecessary_requests)
+        
+        logging.info("Navigating to Solscan for address %s", address)
+        await page.goto(url, timeout=120_000, wait_until="domcontentloaded")
+        
+        await page.wait_for_selector("button:has-text('Export CSV'), div.text-sm.text-gray-500:has-text('Tx Hash')", timeout=120_000)
+        logging.info("Page content loaded, ready to export.")
+
+        await click_export(page)
+        path = await click_dialog_download(page)
+        
+        if not path: return None
+            
         df = pd.read_csv(path)
         df.columns = [c.lower().replace(" ", "_") for c in df.columns]
         if "block_time" in df.columns:
             df["block_time"] = df["block_time"].apply(_to_dt)
         return df
-    except Exception as e:
-        logging.error("CSV parse error %s: %s", path, e)
+    except PwTimeout as e:
+        logging.error("Playwright Timeout for %s: %s", address, str(e).split('\n')[0])
         return None
+    except Exception as e:
+        logging.error("General error in grab_csv for %s: %s", address, e)
+        return None
+    finally:
+        if page: await page.close()
+        if ctx: await ctx.close()
 
-# ──────────── Latest timestamp ────────────
+# ──────────── Helper functions ────────────
 def latest_ts(addr: str) -> datetime | None:
-    res = (
-        sb.table("tracked_transactions")
-          .select("block_time")
-          .eq("tracked_address", addr)
-          .order("block_time", desc=True)
-          .limit(1)
-          .execute()
-    )
-    if res.data:
-        return datetime.fromisoformat(res.data[0]["block_time"])
-    return None
+    res = sb.table("tracked_transactions").select("block_time").eq("tracked_address", addr).order("block_time", desc=True).limit(1).execute()
+    return datetime.fromisoformat(res.data[0]["block_time"]) if res.data else None
 
-# ──────────── Filter new transactions ────────────
 def filter_new(df: pd.DataFrame, addr: str) -> pd.DataFrame:
     last = latest_ts(addr)
-    if last is None:            # адрес ещё не попадался
-        return df
-    return df[df["block_time"] > last]
-
-# ──────────── Save bundle event ────────────
-def save_bundle_event(user_id, chat_id, addr, tx_hash, amount):
-    sb.table("bundle_events").insert({
-        "id": str(uuid.uuid4()),
-        "user_id": user_id,
-        "chat_id": chat_id,
-        "address_to_track": addr,
-        "tx_hash": tx_hash,
-        "amount_sol": amount,
-        "happened_at": datetime.now(timezone.utc),
-        "sent": False
-    }).execute()
-    
-# ──────────── Supabase ────────────
-
+    return df if last is None else df[df["block_time"] > last]
 
 def upsert_to_supabase(df: pd.DataFrame, address: str):
-    """Вставляем **все** строки как есть (дубликаты допускаются)."""
     df.columns = [c.lower().replace(" ", "_") for c in df.columns]
-    # Sanitize data to avoid JSON serialization errors (NaN / ±inf → None)
-    df = (
-        df.replace([np.inf, -np.inf], np.nan)   # ±inf → NaN
-          .where(pd.notnull(df), None)          # NaN → None (JSON null)
-    )
+    df = df.replace([np.inf, -np.inf], np.nan).where(pd.notnull(df), None)
 
-    # block_time в CSV иногда NaN → postgres timestampz допускает NULL
     if "block_time" in df.columns:
-        df["block_time"] = df["block_time"].replace({np.nan: None})
-        # → ISO‑строки, чтобы json.dumps не падал
-        def _bt_to_iso(x):
-            if pd.isna(x):
-                return None
-            # Если число – epoch
-            if isinstance(x, (int, float)):
-                dt = datetime.utcfromtimestamp(int(x))
-            elif isinstance(x, pd.Timestamp):
-                dt = x.to_pydatetime()
-            elif isinstance(x, datetime):
-                dt = x
-            else:
-                return None
-            return dt.replace(tzinfo=timezone.utc).isoformat()
-
-        df["block_time"] = df["block_time"].apply(_bt_to_iso)
+        df["block_time"] = df["block_time"].apply(_to_dt).apply(lambda x: x.isoformat() if pd.notna(x) else None)
 
     df["tracked_address"] = address
     rows: List[dict[str, Any]] = df.to_dict("records")
-    if not rows:
-        return
-    # ⚠️ без on_conflict – вставляем всё подряд
+    if not rows: return
     sb.table("tracked_transactions").insert(rows).execute()
-    logging.info("Inserted %d rows for %s", len(rows), address)
+    logging.info("Inserted %d new rows for %s", len(rows), address)
  
-# ──────────── Convert to datetime ────────────   
 def _to_dt(x):
-    if pd.isna(x):
+    if pd.isna(x): return pd.NaT
+    if isinstance(x, (int, float, np.integer)): return datetime.fromtimestamp(int(x), tz=timezone.utc)
+    if isinstance(x, pd.Timestamp): return x.to_pydatetime().replace(tzinfo=timezone.utc) if x.tzinfo is None else x.to_pydatetime()
+    if isinstance(x, datetime): return x.replace(tzinfo=timezone.utc) if x.tzinfo is None else x
+    try:
+        return datetime.fromisoformat(str(x)).replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
         return pd.NaT
-    # epoch (int/float/np.int64) → datetime
-    if isinstance(x, (int, float, np.integer)):
-        return datetime.utcfromtimestamp(int(x)).replace(tzinfo=timezone.utc)
-    # уже Timestamp / datetime
-    if isinstance(x, pd.Timestamp):
-        return x.to_pydatetime().replace(tzinfo=timezone.utc)
-    if isinstance(x, datetime):
-        return x.replace(tzinfo=timezone.utc)
-    return pd.NaT
 
 # ──────────── MAIN LOOP ────────────
 async def main():
-    async with browser_ctx() as browser:
-        while True:
-            # Refresh the list of tracked addresses each cycle
-            res = sb.table("address_alerts").select("address_to_track").execute().data or []
-            addresses = {row["address_to_track"] for row in res}
-            if not addresses:
-                logging.error("No addresses in Supabase. Populate address_alerts table.")
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-            for addr in addresses:
-                df = await grab_csv(addr, browser)
-                if df is not None:
-                    df = filter_new(df, addr)
-                    if not df.empty:
-                        upsert_to_supabase(df, addr)   # или insert, если без upsert
-            await asyncio.sleep(POLL_INTERVAL)
+    pw = await async_playwright().start()
+    
+    logging.info("Начинаю предварительную проверку всех прокси из списка...")
+    working_proxies = []
+    for proxy in PROXIES:
+        if await check_proxy(pw, proxy):
+            working_proxies.append(proxy)
+    
+    if not working_proxies:
+        logging.error("Не найдено ни одного рабочего прокси. Воркер не может быть запущен. Проверьте список прокси.")
+        await pw.stop()
+        return
 
+    logging.info(f"Проверка завершена. Найдено рабочих прокси: {len(working_proxies)} из {len(PROXIES)}.")
+    _proxy_cycle = itertools.cycle(working_proxies)
+
+    while True:
+        res = sb.table("address_alerts").select("address_to_track").execute().data or []
+        addresses = {row["address_to_track"] for row in res}
+        if not addresses:
+            logging.warning("No addresses to track in Supabase. Waiting...")
+            await asyncio.sleep(POLL_INTERVAL * 2)
+            continue
+
+        for addr in addresses:
+            df = None
+            for attempt in range(MAX_RETRIES):
+                browser = None
+                proxy_url = next(_proxy_cycle) # Берем следующий рабочий прокси
+                try:
+                    logging.info("Processing address: %s (Attempt %d/%d via %s)", addr, attempt + 1, MAX_RETRIES, proxy_url)
+                    browser = await pw.chromium.launch(headless=HEADLESS, proxy={"server": proxy_url})
+                    df = await grab_csv(addr, browser)
+                    if df is not None:
+                        logging.info("Successfully fetched data for %s", addr)
+                        break 
+                except Exception as e:
+                    logging.error("Critical error during attempt %d for %s: %s", attempt + 1, addr, e)
+                finally:
+                    if browser: await browser.close()
+                
+                if df is None:
+                    logging.warning("Attempt %d failed for %s. Retrying with new proxy in 5 seconds...", attempt + 1, addr)
+                    await asyncio.sleep(5)
+
+            if df is not None:
+                new_df = filter_new(df, addr)
+                if not new_df.empty:
+                    upsert_to_supabase(new_df, addr)
+                else:
+                    logging.info("No new transactions found for %s", addr)
+            else:
+                logging.error("All %d attempts failed for address %s. Skipping for this cycle.", MAX_RETRIES, addr)
+
+        logging.info("Cycle finished. Waiting %d seconds for the next one.", POLL_INTERVAL)
+        await asyncio.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("Interrupted")
+        logging.info("Interrupted by user.")

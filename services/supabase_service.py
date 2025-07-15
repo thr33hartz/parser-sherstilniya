@@ -13,6 +13,8 @@ from datetime import datetime
 
 from supabase_client import supabase
 
+def get_table(table_name):
+    return supabase.table(table_name)
 # --- Функции для работы с Шаблонами (Templates) ---
 
 async def fetch_user_templates(user_id: int) -> List[Dict[str, Any]]:
@@ -106,7 +108,8 @@ async def fetch_dev_stats_by_criteria(start_time: datetime, platforms: list, cat
             'categories_filter': categories or None
         }
         response = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: supabase.rpc('get_filtered_dev_stats', params).execute()
+            None,
+            lambda: supabase.rpc('get_filtered_dev_stats_v2', params).execute()
         )
         return response.data or []
     except Exception as e:
@@ -183,9 +186,15 @@ async def delete_bundle_alert(user_id: int, address_to_delete: str) -> bool:
         print(f"DB_ERROR: delete_bundle_alert failed for user {user_id}: {e}")
         return False
     
-async def fetch_deployed_tokens_for_devs(developer_addresses: list) -> list:
+async def fetch_deployed_tokens_for_devs(
+    developer_addresses: list,
+    start_time: Optional[datetime] = None
+) -> list:
     """
-    Получает все записи из `dev_deployed_tokens` для заданного списка адресов разработчиков.
+    Получает все записи из `dev_deployed_tokens` для переданных адресов разработчиков.
+
+    Если указан `start_time`, дополнительно фильтрует только те токены,
+    дата запуска (колонка `token_launch_time`) которых ⩾ `start_time`.
     """
     if not developer_addresses:
         return []
@@ -196,14 +205,61 @@ async def fetch_deployed_tokens_for_devs(developer_addresses: list) -> list:
         for i in range(0, len(developer_addresses), batch_size):
             batch = developer_addresses[i:i + batch_size]
             response = await asyncio.get_event_loop().run_in_executor(
-                None, lambda b=batch: supabase.table("dev_deployed_tokens")
-                                      .select("*")
-                                      .in_("developer_address", b)
-                                      .execute()
+                None,
+                lambda b=batch, st=start_time: (
+                    supabase.table("dev_deployed_tokens")
+                            .select("*")
+                            .in_("developer_address", b)
+                            .gte("token_launch_time", st.isoformat())  # фильтр по времени
+                            if st else
+                    supabase.table("dev_deployed_tokens")
+                            .select("*")
+                            .in_("developer_address", b)
+                ).execute()
             )
             if response.data:
                 all_tokens.extend(response.data)
         return all_tokens
     except Exception as e:
         print(f"DB_ERROR: fetch_deployed_tokens_for_devs failed: {e}")
+        return []
+    
+async def get_latest_pnl_for_traders(traders: list, max_age_hours: int = 24):
+    if not traders:
+        return []
+    try:
+        start_time = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+        response = supabase.table("pnl_batches").select("*").in_("wallet", traders).gte("batch_created_at", start_time.isoformat()).execute()
+        if not response.data:
+            return []
+        df = pd.DataFrame(response.data)
+        latest_df = df.loc[df.groupby('wallet')['batch_created_at'].idxmax()]
+        return latest_df.to_dict(orient="records")
+    except Exception as e:
+        print(f"Error fetching latest PNL: {e}")
+        return []
+    
+async def get_pnl_for_period(start_time: datetime):
+    try:
+        response = supabase.table("pnl_batches").select("*").gte("batch_created_at", start_time.isoformat()).execute()
+        return response.data or []
+    except Exception as e:
+        print(f"Error fetching PNL for period: {e}")
+        return []
+    
+async def fetch_pnl_batches_for_period(start_time: datetime) -> List[Dict[str, Any]]:
+    """Получает все строки pnl_batches за период (batch_created_at >= start_time), берет свежие по wallet."""
+    try:
+        response = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: supabase.table("pnl_batches").select("*").gte("batch_created_at", start_time.isoformat()).execute()
+        )
+        if not response.data:
+            return []
+        
+        # Обработка в Python: группируем по wallet, берем строку с max(batch_created_at)
+        df = pd.DataFrame(response.data)
+        latest_df = df.loc[df.groupby('wallet')['batch_created_at'].idxmax()]
+        return latest_df.to_dict(orient='records')
+    except Exception as e:
+        print(f"DB_ERROR: fetch_pnl_batches_for_period failed: {e}")
         return []

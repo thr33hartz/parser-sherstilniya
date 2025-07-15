@@ -11,6 +11,7 @@ load_dotenv(dotenv_path=env_path)
 os.environ['SSL_CERT_FILE'] = certifi.where()
 
 import asyncio
+import random  # for jitter back‑off
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone, timedelta
@@ -35,12 +36,11 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # --- Конфигурация Воркера ---
-DEV_STATS_BATCH_SIZE = 15
+DEV_STATS_BATCH_SIZE = 50          # обрабатываем больше адресов за цикл
 TOKEN_FETCH_LOOP_SLEEP_SECONDS = 20
-# ИСПРАВЛЕНО: Добавляем временное окно для поиска
-DEV_DISCOVERY_TOKEN_HOURS = 48  # Искать девов по токенам за последние 48 часов
+DEV_DISCOVERY_TOKEN_HOURS = 48     # оставляем как есть
 DEV_DISCOVERY_LOOP_SLEEP_SECONDS = 300
-DEV_STATS_LOOP_SLEEP_SECONDS = 120
+DEV_STATS_LOOP_SLEEP_SECONDS = 10  # короткая пауза; high‑throughput
 
 # --- Функции-помощники ---
 
@@ -50,18 +50,48 @@ def is_valid_solana_address(address: str) -> bool:
         return False
     return 32 <= len(address) <= 44
 
-async def upsert_data_to_supabase(stats_data: list, tokens_data: list):
-    """Сохраняет пачки данных в Supabase."""
+
+async def safe_upsert(table: str, rows: list, *, on_conflict: str,
+                      chunk: int = 250, max_retries: int = 4,
+                      base_delay: float = 1.0):
+    """
+    Upsert rows to Supabase in manageable chunks with exponential
+    back‑off & jitter to avoid http2 stream resets / 429 throttling.
+    """
     loop = asyncio.get_event_loop()
+    for i in range(0, len(rows), chunk):
+        part = rows[i:i + chunk]
+        for attempt in range(1, max_retries + 1):
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda p=part: supabase.table(table)
+                                    .upsert(p, on_conflict=on_conflict)
+                                    .execute()
+                )
+                break  # success
+            except Exception as exc:
+                if attempt == max_retries:
+                    logger.error("UPSERT %s FAILED after %s tries: %s",
+                                 table, attempt, exc)
+                    break
+                delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.3)
+                logger.warning("UPSERT %s retry %s/%s in %.1fs",
+                               table, attempt, max_retries, delay)
+                await asyncio.sleep(delay)
+
+
+async def upsert_data_to_supabase(stats_data: list, tokens_data: list):
+    """Wrapper that delegates to safe_upsert with sensible chunks."""
     try:
         if stats_data:
-            await loop.run_in_executor(None, lambda: supabase.table("developer_stats").upsert(stats_data, on_conflict="developer_address").execute())
-            logger.info(f"Upserted {len(stats_data)} developer stats records.")
+            await safe_upsert("developer_stats", stats_data,
+                              on_conflict="developer_address", chunk=100)
         if tokens_data:
-            await loop.run_in_executor(None, lambda: supabase.table("dev_deployed_tokens").upsert(tokens_data, on_conflict="token_address").execute())
-            logger.info(f"Upserted {len(tokens_data)} deployed token records.")
+            await safe_upsert("dev_deployed_tokens", tokens_data,
+                              on_conflict="token_address", chunk=250)
     except Exception as e:
-        logger.error(f"SUPABASE_UPSERT_ERROR: {e}", exc_info=True)
+        logger.error("SUPABASE_UPSERT_ERROR (final): %s", e, exc_info=True)
 
 
 # --- Основные циклы воркера ---
@@ -113,16 +143,21 @@ async def dev_stats_update_loop():
 
             logger.info(f"DEV_STATS_LOOP: Found {len(dev_addresses_to_process)} valid developers to process.")
 
-            for address in dev_addresses_to_process:
-                # ИСПРАВЛЕНО: Вызываем функцию только с одним аргументом `address`
-                stats, tokens = await fetch_dev_pnl.fetch_dev_data_from_api(address)
-                
-                if stats and len(stats) > 1:
-                    stats['last_updated_at'] = datetime.now(timezone.utc).isoformat()
-                    await upsert_data_to_supabase([stats], tokens or [])
-                
-                logger.info(f"DEV_STATS_LOOP: Processed {address}. Waiting 10 seconds...")
-                await asyncio.sleep(3)
+            # ── Параллельная обработка девов ────────────────────────────────
+            semaphore = asyncio.Semaphore(20)  # максимум 20 одновременных запросов
+
+            async def process_one(addr: str):
+                async with semaphore:
+                    try:
+                        stats, tokens = await fetch_dev_pnl.fetch_dev_data_from_api(addr)
+                        if stats and len(stats) > 1:
+                            stats["last_updated_at"] = datetime.now(timezone.utc).isoformat()
+                            await upsert_data_to_supabase([stats], tokens or [])
+                        logger.info("DEV_STATS_LOOP: Done %s", addr)
+                    except Exception as exc:
+                        logger.error("DEV_STATS_LOOP: Error processing %s: %s", addr, exc, exc_info=True)
+
+            await asyncio.gather(*(process_one(a) for a in dev_addresses_to_process))
 
         except Exception as e:
             logger.error(f"DEV_STATS_LOOP: A critical error occurred: {e}", exc_info=True)
